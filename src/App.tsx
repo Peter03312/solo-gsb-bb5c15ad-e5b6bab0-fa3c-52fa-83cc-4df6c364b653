@@ -9,7 +9,9 @@ import { findCandidateSeams, type SeamResult } from './audio/loopFinder';
 import { detectPeriods, type PeriodCandidate, type PeriodDetectFailure } from './audio/periodDetect';
 import { buildLoopPcm } from './audio/loopBuffer';
 import { analyzeSeamSpectrum } from './audio/seamSpectrum';
+import { normalizeLoopLoudness } from './audio/loudness';
 import { encodeWav, wavFileSize } from './audio/wavExport';
+import { LoudnessPanel } from './components/LoudnessPanel';
 import type { MonoCompatInterval, MonoCompatResult } from './audio/monoCompatibility';
 import type { MonoCompatWorkerResponse } from './workers/monoCompatWorker';
 import type { OnsetDetectResult } from './audio/onsetDetect';
@@ -55,6 +57,8 @@ export default function App() {
   const [radiusMs, setRadiusMs] = useState(50);
   const [crossfadeMs, setCrossfadeMs] = useState(20);
   const [specWindowMs, setSpecWindowMs] = useState(200);
+  // 目标响度（dBFS）：循环试听与 WAV 下载共用按该目标归一化后的 PCM
+  const [targetLoudnessDbfs, setTargetLoudnessDbfs] = useState(-16);
   const [playing, setPlaying] = useState<PlayTarget | null>(null);
   const [status, setStatus] = useState('请导入 WAV / MP3 音频文件（音频仅在本地浏览器处理，不会上传）。');
   const [busy, setBusy] = useState(false);
@@ -104,6 +108,14 @@ export default function App() {
     if (!loopPcm) return null;
     return analyzeSeamSpectrum(loopPcm, (specWindowMs / 1000) * loopPcm.sampleRate);
   }, [loopPcm, specWindowMs]);
+
+  // 目标响度归一化：对当前候选的循环 PCM 做门控响度测量并按目标施加统一增益
+  // （峰值限制 −1 dBFS，静音时保留原声）。循环试听与 WAV 下载共用该处理结果；
+  // 切换候选 / 选区 / 淡化参数 / 目标响度时自动重算
+  const processedLoop = useMemo(() => {
+    if (!loopPcm) return null;
+    return normalizeLoopLoudness(loopPcm, targetLoudnessDbfs);
+  }, [loopPcm, targetLoudnessDbfs]);
 
   const getPlayer = (): LoopPlayer => {
     if (!playerRef.current) playerRef.current = new LoopPlayer();
@@ -625,12 +637,19 @@ export default function App() {
       if (!buffer) return;
       const s = list[idx];
       if (!s) return;
-      const pcm = buildLoopPcm(buffer, s.startSample, s.endSample, (crossfadeMs / 1000) * buffer.sampleRate);
+      const raw = buildLoopPcm(
+        buffer,
+        s.startSample,
+        s.endSample,
+        (crossfadeMs / 1000) * buffer.sampleRate,
+      );
+      // 与 WAV 下载完全同口径：门控响度归一化后的 PCM（静音时保留原声）
+      const { pcm } = normalizeLoopLoudness(raw, targetLoudnessDbfs);
       setOnsetPlayingIdx(null);
       await getPlayer().play(pcm);
       setPlaying('optimized');
     },
-    [buffer, crossfadeMs],
+    [buffer, crossfadeMs, targetLoudnessDbfs],
   );
 
   const playOptimized = useCallback(async () => {
@@ -812,6 +831,14 @@ export default function App() {
     if (playing === 'optimized') void playOptimized();
   }, [crossfadeMs, playing, playOptimized]);
 
+  // 目标响度变化时，若正在试听优化区间也实时按新目标重建并继续播放
+  const targetLoudnessRef = useRef(targetLoudnessDbfs);
+  useEffect(() => {
+    if (targetLoudnessRef.current === targetLoudnessDbfs) return;
+    targetLoudnessRef.current = targetLoudnessDbfs;
+    if (playing === 'optimized') void playOptimized();
+  }, [targetLoudnessDbfs, playing, playOptimized]);
+
   const exportJson = useCallback(() => {
     if (!buffer || !selection || !seam) return;
     const sr = buffer.sampleRate;
@@ -901,6 +928,30 @@ export default function App() {
           }
         : null,
       seamCost: seam.cost,
+      // 目标响度归一化：门控响度、施加增益与峰值限幅；静音时 silent=true 且保留原声
+      loudnessNormalization: processedLoop
+        ? {
+            targetDbfs: roundTo(processedLoop.targetDbfs, 2),
+            measuredDbfs: processedLoop.loudnessDbfs === null ? null : roundTo(processedLoop.loudnessDbfs, 2),
+            appliedGainDb: roundTo(processedLoop.appliedGainDb, 2),
+            actualDbfs: processedLoop.actualDbfs === null ? null : roundTo(processedLoop.actualDbfs, 2),
+            peakBeforeDbfs: processedLoop.peakBeforeDbfs === null ? null : roundTo(processedLoop.peakBeforeDbfs, 2),
+            peakAfterDbfs: processedLoop.peakAfterDbfs === null ? null : roundTo(processedLoop.peakAfterDbfs, 2),
+            peakLimited: processedLoop.peakLimited,
+            silent: processedLoop.silent,
+            parameters: {
+              windowMs: 400,
+              hopMs: 100,
+              windowing: 'circular',
+              absoluteGateDbfs: -70,
+              relativeGateDb: 10,
+              peakCeilingDbfs: -1,
+            },
+            totalWindows: processedLoop.totalWindows,
+            gatedWindowsAbs: processedLoop.gatedWindowsAbs,
+            gatedWindowsRel: processedLoop.gatedWindowsRel,
+          }
+        : null,
       // 接缝频谱诊断：参数与结果（差值矩阵为 头 − 尾，帧按与接缝的距离配对）
       spectrumDiagnostics: spectrum
         ? {
@@ -982,12 +1033,12 @@ export default function App() {
         (compatResult ? `，含 ${compatResult.intervals.length} 个单声道兼容性风险区间` : '') +
         '。',
     );
-  }, [buffer, selection, seam, candidates, selectedIdx, fileName, radiusMs, crossfadeMs, spectrum, specWindowMs, appliedPeriod, periodCandidates, fixedLoopSamples, repeatResult, compatResult]);
+  }, [buffer, selection, seam, candidates, selectedIdx, fileName, radiusMs, crossfadeMs, spectrum, specWindowMs, appliedPeriod, periodCandidates, fixedLoopSamples, repeatResult, compatResult, processedLoop]);
 
   const exportWav = useCallback(() => {
-    if (!buffer || !seam) return;
-    const pcm = buildLoopPcm(buffer, seam.startSample, seam.endSample, (crossfadeMs / 1000) * buffer.sampleRate);
-    const wav = encodeWav(pcm);
+    if (!buffer || !seam || !processedLoop) return;
+    // 与循环试听完全同一份处理后 PCM（门控响度归一化；静音时保留原声）
+    const wav = encodeWav(processedLoop.pcm);
     const blob = new Blob([wav], { type: 'audio/wav' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -995,10 +1046,17 @@ export default function App() {
     a.download = `${fileName.replace(/\.[^.]+$/, '') || 'loop'}.loop.wav`;
     a.click();
     URL.revokeObjectURL(url);
+    const n = processedLoop;
+    const loudnessNote = n.silent
+      ? '循环接近静音，保留原声未施加增益'
+      : `响度 ${n.loudnessDbfs!.toFixed(2)} → ${n.actualDbfs!.toFixed(2)} dBFS` +
+        `（目标 ${n.targetDbfs.toFixed(1)} dBFS，增益 ${n.appliedGainDb >= 0 ? '+' : ''}${n.appliedGainDb.toFixed(2)} dB` +
+        `${n.peakLimited ? '，已按 −1 dBFS 峰值限幅' : ''}）`;
     setStatus(
-      `已导出 WAV（候选 #${selectedIdx + 1}）：16-bit PCM，含 smpl 循环区块（0 → 最后一帧），共 ${fmtBytes(wav.byteLength)}。`,
+      `已导出 WAV（候选 #${selectedIdx + 1}）：16-bit PCM，含 smpl 循环区块（0 → 最后一帧），` +
+        `${loudnessNote}，共 ${fmtBytes(wav.byteLength)}。`,
     );
-  }, [buffer, seam, selectedIdx, crossfadeMs, fileName]);
+  }, [buffer, seam, selectedIdx, processedLoop, fileName]);
 
   const sr = buffer?.sampleRate ?? 44100;
 
@@ -1257,7 +1315,8 @@ export default function App() {
               <p className="export-info">
                 WAV 导出（候选 #{selectedIdx + 1}）：{buffer.sampleRate} Hz · {buffer.numberOfChannels} 声道 ·{' '}
                 {wavFrames.toLocaleString()} 帧 · 预计 {fmtBytes(wavBytes)}
-                （16-bit PCM，含 smpl 循环区块）
+                （16-bit PCM，含 smpl 循环区块；按目标响度 {targetLoudnessDbfs.toFixed(1)} dBFS 归一化，
+                与「试听选中候选」同一份处理后 PCM）
               </p>
             )}
           </section>
@@ -1308,6 +1367,15 @@ export default function App() {
               candidateLabel={`候选 #${selectedIdx + 1}`}
               windowMs={specWindowMs}
               onWindowMsChange={setSpecWindowMs}
+            />
+          )}
+
+          {seam && buffer && (
+            <LoudnessPanel
+              result={processedLoop}
+              candidateLabel={`候选 #${selectedIdx + 1}`}
+              targetDbfs={targetLoudnessDbfs}
+              onTargetDbfsChange={setTargetLoudnessDbfs}
             />
           )}
 
