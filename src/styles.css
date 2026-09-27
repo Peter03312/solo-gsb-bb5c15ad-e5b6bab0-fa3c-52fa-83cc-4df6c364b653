@@ -587,6 +587,83 @@ td.compat-bad {
   color: #7fe6b0;
 }
 
+/* 目标响度归一化面板 */
+.loudness h2 {
+  margin: 0 0 8px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.loudness-desc {
+  margin: 0 0 12px;
+  font-size: 12px;
+  color: #9aa7bd;
+}
+
+.loudness-slider {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: 480px;
+  font-size: 13px;
+  color: #9aa7bd;
+  margin-bottom: 12px;
+}
+
+.loudness-slider b {
+  color: #e6ebf5;
+}
+
+.loudness-readout {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  margin-top: 4px;
+}
+
+.loudness-readout th,
+.loudness-readout td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid #232c40;
+  font-variant-numeric: tabular-nums;
+}
+
+.loudness-readout th {
+  color: #9aa7bd;
+  font-weight: 500;
+  font-size: 12px;
+  width: 22%;
+}
+
+.loudness-readout .lo-original {
+  color: #9fc0ff;
+}
+
+.loudness-readout .lo-actual b {
+  color: #7fe6b0;
+}
+
+.loudness-readout .stale {
+  color: #ffb020;
+  font-style: normal;
+  margin-left: 6px;
+  font-size: 12px;
+}
+
+.loudness-note {
+  margin: 10px 0 0;
+  font-size: 12px;
+}
+
+.loudness-note .limiter-active {
+  color: #ffb020;
+}
+
+.loudness-note .limiter-ok {
+  color: #7fe6b0;
+}
+
 .cost {
   margin: 10px 0 0;
   font-size: 12px;

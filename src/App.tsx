@@ -3,11 +3,14 @@ import { Waveform, type Region, type SeamMarker } from './components/Waveform';
 import { SeamSpectrumPanel } from './components/SeamSpectrumPanel';
 import { MonoCompatPanel, type MonoCompatPlayTarget } from './components/MonoCompatPanel';
 import { OnsetSlicePanel } from './components/OnsetSlicePanel';
+import { LoudnessPanel } from './components/LoudnessPanel';
 import { LoopPlayer } from './audio/player';
 import { decodeAudioFile } from './audio/decode';
 import { findCandidateSeams, type SeamResult } from './audio/loopFinder';
 import { detectPeriods, type PeriodCandidate, type PeriodDetectFailure } from './audio/periodDetect';
 import { buildLoopPcm } from './audio/loopBuffer';
+import { normalizeLoopLoudness } from './audio/loudness';
+import type { PcmBuffer } from './audio/types';
 import { analyzeSeamSpectrum } from './audio/seamSpectrum';
 import { encodeWav, wavFileSize } from './audio/wavExport';
 import type { MonoCompatInterval, MonoCompatResult } from './audio/monoCompatibility';
@@ -36,6 +39,8 @@ const MONO_COMPAT_WINDOW_MS = 100;
 const MONO_COMPAT_HOP_MS = 50;
 const MONO_COMPAT_QUIET_DBFS = -50;
 const MONO_COMPAT_RISK_LOSS_DB = -6;
+/** 目标响度归一化：默认目标响度（dBFS，流媒体常用 −14 LUFS 量级） */
+const DEFAULT_TARGET_DBFS = -14;
 
 /** 保留 decimals 位小数的有限数值（防御 NaN / Infinity 进入 JSON） */
 const roundTo = (x: number, decimals: number): number => {
@@ -55,6 +60,8 @@ export default function App() {
   const [radiusMs, setRadiusMs] = useState(50);
   const [crossfadeMs, setCrossfadeMs] = useState(20);
   const [specWindowMs, setSpecWindowMs] = useState(200);
+  // 目标响度（dBFS）：循环试听与 WAV 导出共用同一响度归一化处理后 PCM
+  const [targetDbfs, setTargetDbfs] = useState(DEFAULT_TARGET_DBFS);
   const [playing, setPlaying] = useState<PlayTarget | null>(null);
   const [status, setStatus] = useState('请导入 WAV / MP3 音频文件（音频仅在本地浏览器处理，不会上传）。');
   const [busy, setBusy] = useState(false);
@@ -93,17 +100,41 @@ export default function App() {
   // 定长约束的循环长度（采样点）；未吸附周期时为 null（自由搜索）
   const fixedLoopSamples = appliedPeriod ? Math.round(appliedPeriod.periodSamples) : null;
 
-  // 接缝频谱检查：当前候选的循环 PCM（与试听 / 导出口径一致，含交叉淡化），
-  // 切换候选或调整交叉淡化时自动重建，频谱分析随之实时重算
-  const loopPcm = useMemo(() => {
+  // 接缝频谱检查与响度归一化均基于当前候选的循环 PCM（含交叉淡化）。
+  // baseLoopPcm：交叉淡化后、响度处理前的循环 PCM；
+  // normalizedLoop：按目标响度做两级门控测量与增益 / 峰值限制后的 PCM，
+  //   循环试听与 WAV 下载共用同一份处理结果；切换候选、选区或淡化参数 / 目标响度时自动重算。
+  const baseLoopPcm = useMemo(() => {
     if (!buffer || !seam) return null;
     return buildLoopPcm(buffer, seam.startSample, seam.endSample, (crossfadeMs / 1000) * buffer.sampleRate);
   }, [buffer, seam, crossfadeMs]);
+
+  const normalizedLoop = useMemo(() => {
+    if (!baseLoopPcm) return null;
+    return normalizeLoopLoudness(baseLoopPcm, targetDbfs);
+  }, [baseLoopPcm, targetDbfs]);
+
+  // 试听 / 导出 / 频谱检查统一使用响度处理后的 PCM（静音时内部原样返回同一缓冲）
+  const loopPcm = normalizedLoop?.pcm ?? null;
 
   const spectrum = useMemo(() => {
     if (!loopPcm) return null;
     return analyzeSeamSpectrum(loopPcm, (specWindowMs / 1000) * loopPcm.sampleRate);
   }, [loopPcm, specWindowMs]);
+
+  // 切到静音候选（或淡化参数使循环整体静音）时，状态栏明确提示「保留原声」
+  const silentHintKeyRef = useRef('');
+  useEffect(() => {
+    if (!seam) {
+      silentHintKeyRef.current = '';
+      return;
+    }
+    const key = `${seam.startSample}-${seam.endSample}-${crossfadeMs}-${targetDbfs}`;
+    if (normalizedLoop?.loudness.silent && silentHintKeyRef.current !== key) {
+      silentHintKeyRef.current = key;
+      setStatus('当前循环整体静音：全部环形窗均低于 −70 dBFS，无法估计门控响度，已保留原声（不施加增益）。');
+    }
+  }, [normalizedLoop, seam, crossfadeMs, targetDbfs]);
 
   const getPlayer = (): LoopPlayer => {
     if (!playerRef.current) playerRef.current = new LoopPlayer();
@@ -619,18 +650,33 @@ export default function App() {
     setPlaying('original');
   }, [buffer, selection]);
 
+  /**
+   * 构建指定候选「交叉淡化 + 目标响度归一化」后的循环 PCM，
+   * 与 WAV 下载、频谱检查使用同一处理链（同一份处理后 PCM）。
+   */
+  const buildPlayablePcm = useCallback(
+    (s: SeamResult): PcmBuffer => {
+      if (!buffer) throw new Error('audio buffer not loaded');
+      const base = buildLoopPcm(buffer, s.startSample, s.endSample, (crossfadeMs / 1000) * buffer.sampleRate);
+      return normalizeLoopLoudness(base, targetDbfs).pcm;
+    },
+    [buffer, crossfadeMs, targetDbfs],
+  );
+
   /** 循环试听指定候选（idx 缺省为当前选中项；无候选时先自动搜索） */
   const playCandidate = useCallback(
     async (list: SeamResult[], idx: number) => {
-      if (!buffer) return;
       const s = list[idx];
       if (!s) return;
-      const pcm = buildLoopPcm(buffer, s.startSample, s.endSample, (crossfadeMs / 1000) * buffer.sampleRate);
+      // 当前选中候选直接使用与 WAV 下载 / 频谱检查同一份 memoized 处理后 PCM；
+      // 点选其它候选（selectedIdx 尚未更新）时按完全相同的处理链即时构建
+      const pcm =
+        idx === selectedIdx && normalizedLoop ? normalizedLoop.pcm : buildPlayablePcm(s);
       setOnsetPlayingIdx(null);
       await getPlayer().play(pcm);
       setPlaying('optimized');
     },
-    [buffer, crossfadeMs],
+    [buildPlayablePcm, selectedIdx, normalizedLoop],
   );
 
   const playOptimized = useCallback(async () => {
@@ -804,13 +850,15 @@ export default function App() {
     [buffer, onsetResult, fileName],
   );
 
-  // 交叉淡化时长变化时，若正在试听优化区间则实时重建并继续播放
-  const crossfadeRef = useRef(crossfadeMs);
+  // 交叉淡化时长或目标响度变化时，若正在试听优化区间则以同一条处理链
+  // （交叉淡化 + 响度归一化）实时重建并继续播放，保证听到的就是将导出的 PCM
+  const procParamsRef = useRef({ crossfadeMs, targetDbfs });
   useEffect(() => {
-    if (crossfadeRef.current === crossfadeMs) return;
-    crossfadeRef.current = crossfadeMs;
+    const prev = procParamsRef.current;
+    if (prev.crossfadeMs === crossfadeMs && prev.targetDbfs === targetDbfs) return;
+    procParamsRef.current = { crossfadeMs, targetDbfs };
     if (playing === 'optimized') void playOptimized();
-  }, [crossfadeMs, playing, playOptimized]);
+  }, [crossfadeMs, targetDbfs, playing, playOptimized]);
 
   const exportJson = useCallback(() => {
     if (!buffer || !selection || !seam) return;
@@ -901,6 +949,43 @@ export default function App() {
           }
         : null,
       seamCost: seam.cost,
+      // 目标响度归一化：环形窗两级门控测量、目标增益与统一峰值限制（试听 / 导出口径一致）
+      loudnessNormalization: normalizedLoop
+        ? (() => {
+            const lo = normalizedLoop.loudness;
+            return {
+              appliedTo: 'loop-pcm-after-crossfade',
+              sharedBy: ['loop-audition', 'wav-export'],
+              silent: lo.silent,
+              parameters: {
+                windowMs: 400,
+                hopMs: 100,
+                windowSamples: lo.windowSamples,
+                hopSamples: lo.hopSamples,
+                windowCount: lo.windowCount,
+                circular: true,
+                absoluteGateDbfs: -70,
+                relativeGateDb: -10,
+                passedAbsoluteGate: lo.passedAbsoluteGate,
+                passedRelativeGate: lo.passedRelativeGate,
+                peakCeilDbfs: lo.peakCeilDbfs,
+              },
+              targetDbfs: roundTo(targetDbfs, 2),
+              preliminaryLoudnessDbfs:
+                lo.preliminaryLoudnessDbfs === null ? null : roundTo(lo.preliminaryLoudnessDbfs, 3),
+              originalLoudnessDbfs:
+                lo.originalLoudnessDbfs === null ? null : roundTo(lo.originalLoudnessDbfs, 3),
+              requestedGainDb: roundTo(lo.requestedGainDb, 3),
+              originalPeakDbfs: roundTo(lo.originalPeakDbfs, 3),
+              peakLimiterActive: lo.peakLimiterActive,
+              peakLimiterReason: lo.peakLimiterReason,
+              actualGainDb: roundTo(lo.actualGainDb, 3),
+              actualLoudnessDbfs:
+                lo.actualLoudnessDbfs === null ? null : roundTo(lo.actualLoudnessDbfs, 3),
+              actualPeakDbfs: roundTo(lo.actualPeakDbfs, 3),
+            };
+          })()
+        : null,
       // 接缝频谱诊断：参数与结果（差值矩阵为 头 − 尾，帧按与接缝的距离配对）
       spectrumDiagnostics: spectrum
         ? {
@@ -982,11 +1067,12 @@ export default function App() {
         (compatResult ? `，含 ${compatResult.intervals.length} 个单声道兼容性风险区间` : '') +
         '。',
     );
-  }, [buffer, selection, seam, candidates, selectedIdx, fileName, radiusMs, crossfadeMs, spectrum, specWindowMs, appliedPeriod, periodCandidates, fixedLoopSamples, repeatResult, compatResult]);
+  }, [buffer, selection, seam, candidates, selectedIdx, fileName, radiusMs, crossfadeMs, spectrum, specWindowMs, normalizedLoop, targetDbfs, appliedPeriod, periodCandidates, fixedLoopSamples, repeatResult, compatResult]);
 
   const exportWav = useCallback(() => {
-    if (!buffer || !seam) return;
-    const pcm = buildLoopPcm(buffer, seam.startSample, seam.endSample, (crossfadeMs / 1000) * buffer.sampleRate);
+    if (!buffer || !seam || !normalizedLoop) return;
+    // 与循环试听、频谱检查共用同一份响度处理后 PCM
+    const pcm = normalizedLoop.pcm;
     const wav = encodeWav(pcm);
     const blob = new Blob([wav], { type: 'audio/wav' });
     const url = URL.createObjectURL(blob);
@@ -995,10 +1081,16 @@ export default function App() {
     a.download = `${fileName.replace(/\.[^.]+$/, '') || 'loop'}.loop.wav`;
     a.click();
     URL.revokeObjectURL(url);
+    const lo = normalizedLoop.loudness;
+    const loudnessNote = lo.silent
+      ? '循环整体静音，已保留原声（未施加增益），'
+      : lo.peakLimiterActive
+        ? `原响度 ${lo.originalLoudnessDbfs?.toFixed(2)} dBFS，峰值限幅生效（实际增益 ${lo.actualGainDb.toFixed(2)} dB），实际响度 ${lo.actualLoudnessDbfs?.toFixed(2)} dBFS，`
+        : `原响度 ${lo.originalLoudnessDbfs?.toFixed(2)} dBFS → 实际响度 ${lo.actualLoudnessDbfs?.toFixed(2)} dBFS（目标 ${targetDbfs.toFixed(1)} dBFS），`;
     setStatus(
-      `已导出 WAV（候选 #${selectedIdx + 1}）：16-bit PCM，含 smpl 循环区块（0 → 最后一帧），共 ${fmtBytes(wav.byteLength)}。`,
+      `已导出 WAV（候选 #${selectedIdx + 1}）：${loudnessNote}16-bit PCM，含 smpl 循环区块（0 → 最后一帧），共 ${fmtBytes(wav.byteLength)}。`,
     );
-  }, [buffer, seam, selectedIdx, crossfadeMs, fileName]);
+  }, [buffer, seam, selectedIdx, normalizedLoop, targetDbfs, fileName]);
 
   const sr = buffer?.sampleRate ?? 44100;
 
@@ -1303,12 +1395,19 @@ export default function App() {
           )}
 
           {seam && buffer && (
-            <SeamSpectrumPanel
-              result={spectrum}
-              candidateLabel={`候选 #${selectedIdx + 1}`}
-              windowMs={specWindowMs}
-              onWindowMsChange={setSpecWindowMs}
-            />
+            <>
+              <LoudnessPanel
+                result={normalizedLoop?.loudness ?? null}
+                targetDbfs={targetDbfs}
+                onTargetChange={setTargetDbfs}
+              />
+              <SeamSpectrumPanel
+                result={spectrum}
+                candidateLabel={`候选 #${selectedIdx + 1}`}
+                windowMs={specWindowMs}
+                onWindowMsChange={setSpecWindowMs}
+              />
+            </>
           )}
 
           <section className="panel info">
